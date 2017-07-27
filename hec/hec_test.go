@@ -281,7 +281,49 @@ func TestRetryAbort(t *testing.T) {
 	// Write after close should give EOF
 	_, err = fmt.Fprintln(w, "test write")
 	assert.Equal(io.EOF, err)
+}
 
+// Test that hitting the timeout on a connection causes a retry
+func TestClientTimeoutRetry(t *testing.T) {
+	require := require.New(t)
+	var i uint64
+	timeCh, _, timeAfterConfig := makeTimeAfter()
+
+	ch := make(chan bool)
+	wait := make(chan bool, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddUint64(&i, 1) == 1 {
+			// block until second concurrent request arrives
+			<-ch
+		} else {
+			ch <- true
+			wait <- true
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "token",
+		WithQueueDepth(0),
+		WithRequestTimeout(100*time.Millisecond),
+		timeAfterConfig)
+	w := c.NewEventWriter("", "src", "st", "hst", "idx")
+
+	_, err := fmt.Fprintln(w, "event one")
+	require.Nil(err, "event one write should succeed")
+
+	// force a timeout
+	timeCh <- time.Now()
+
+	// wait for flush
+	select {
+	case <-wait:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	// flush should of succeeded so close should succeed
+	err = c.Close(100 * time.Millisecond)
+	require.Nil(err, "Close should not error")
 }
 
 func TestBlockOnQueueFull(t *testing.T) {

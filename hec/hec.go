@@ -61,7 +61,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -81,6 +83,11 @@ var (
 
 	// DefaultQueueDepth specifies
 	DefaultQueueDepth = 1000
+
+	// DefaultRequestTimeout sets the maximum amount of time an individual
+	// data transmission request to Splunk should take before its canceled
+	// and retried.
+	DefaultRequestTimeout = 30 * time.Second
 )
 
 // Errors returned by the client.
@@ -205,21 +212,42 @@ func WithHTTPClient(client *http.Client) Config {
 	}
 }
 
+// WithRequestTimeout sets a limit for the maximum amount of time a request
+// can take to flush data to Splunk.   If the timeout is reached, the request
+// will be retried.  This should not be too low, so that only genuinely stuck
+// requests are retried.
+func WithRequestTimeout(timeout time.Duration) Config {
+	return func(c *Client) {
+		c.requestTimeout = timeout
+	}
+}
+
+// WithErrLog defines a logger that should receive messages about problems
+// this client has sending data to Splunk.  Defaults to stderr.  Set to nil
+// to suppress all notices.
+func WithErrLog(log *log.Logger) Config {
+	return func(c *Client) {
+		c.errLog = log
+	}
+}
+
 // Client implements an HTTP Event Collector client.
 type Client struct {
-	client        *http.Client
-	url           string
-	token         string
-	flushInterval time.Duration
-	bufferSize    int
-	workQueue     chan []byte
-	err           chan error
-	m             sync.RWMutex
-	isClosed      bool
-	backoff       backoff.BackOff
-	cancel        context.CancelFunc
-	dropOnFull    bool
-	noCompress    bool
+	client         *http.Client
+	requestTimeout time.Duration
+	url            string
+	token          string
+	flushInterval  time.Duration
+	bufferSize     int
+	workQueue      chan []byte
+	err            chan error
+	errLog         *log.Logger
+	m              sync.RWMutex
+	isClosed       bool
+	backoff        backoff.BackOff
+	cancel         context.CancelFunc
+	dropOnFull     bool
+	noCompress     bool
 	// used by unit tests to control time
 	timeAfter func(d time.Duration) <-chan time.Time
 }
@@ -240,16 +268,18 @@ func New(url string, token string, config ...Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &Client{
-		client:        http.DefaultClient,
-		url:           url,
-		token:         token,
-		flushInterval: DefaultFlushInterval,
-		bufferSize:    DefaultBufferSize,
-		workQueue:     make(chan []byte, DefaultQueueDepth),
-		err:           make(chan error),
-		backoff:       backoff.NewExponentialBackOff(),
-		cancel:        cancel,
-		timeAfter:     time.After,
+		client:         http.DefaultClient,
+		requestTimeout: DefaultRequestTimeout,
+		url:            url,
+		token:          token,
+		flushInterval:  DefaultFlushInterval,
+		bufferSize:     DefaultBufferSize,
+		workQueue:      make(chan []byte, DefaultQueueDepth),
+		err:            make(chan error),
+		errLog:         log.New(os.Stderr, "", log.LstdFlags),
+		backoff:        backoff.NewExponentialBackOff(),
+		cancel:         cancel,
+		timeAfter:      time.After,
 	}
 	for _, cfg := range config {
 		cfg(client)
@@ -369,6 +399,7 @@ func (c *Client) worker(ctx context.Context) {
 
 		b.Flush() // ensure any buffered data is flushed through
 		if err := c.flush(ctx, b); err != nil {
+			c.log("hard failure sending data to Splunk: %v", err)
 			// swallow any more data written into the channel until its closed
 			for {
 				select {
@@ -419,8 +450,13 @@ func (c *Client) flush(ctx context.Context, buf *buffer) error {
 func (c *Client) send(buf *buffer) error {
 	req, err := http.NewRequest("POST", c.url, buf)
 	if err != nil {
+		c.log("Failed to create HTTP request: %v", err)
 		return err
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel() // ensure context resources are released
+	req = req.WithContext(ctx)
 	if !c.noCompress {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
@@ -428,6 +464,7 @@ func (c *Client) send(buf *buffer) error {
 	req.Header.Set("Authorization", "Splunk "+c.token)
 	resp, err := c.client.Do(req)
 	if err != nil {
+		c.log("HTTP request to Splunk failed: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -438,6 +475,7 @@ func (c *Client) send(buf *buffer) error {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
 		err := fmt.Errorf("event send failed status=%q error=%q", resp.Status, string(body))
+		c.log("HEC event send failed status=%q error=%q", resp.Status, string(body))
 		if resp.StatusCode >= 400 && resp.StatusCode <= 499 {
 			// configuration error; retrying won't help.
 			err = backoff.Permanent(err)
@@ -446,6 +484,12 @@ func (c *Client) send(buf *buffer) error {
 	}
 
 	return nil
+}
+
+func (c *Client) log(format string, v ...interface{}) {
+	if c.errLog != nil {
+		c.errLog.Printf("splunk-hec "+format, v...)
+	}
 }
 
 // EventWriter implements an io.Writer interface for sending events to
