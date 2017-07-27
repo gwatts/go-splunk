@@ -81,8 +81,9 @@ var (
 	// server ahead of DefaultFlushInterval being reached.
 	DefaultBufferSize = 128 * 1024
 
-	// DefaultQueueDepth specifies
-	DefaultQueueDepth = 1000
+	// DefaultQueueDepth specifies the number of events that the writer will
+	// buffer before either blocking, or dropping them depending on configuration.
+	DefaultQueueDepth = 10000
 
 	// DefaultRequestTimeout sets the maximum amount of time an individual
 	// data transmission request to Splunk should take before its canceled
